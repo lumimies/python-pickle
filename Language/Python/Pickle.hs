@@ -270,9 +270,18 @@ serialize opcode = case opcode of
     putByteString "U"
     putWord8 . fromIntegral $ S.length s
     putByteString s
+  BINSTRING s -> do
+    putByteString "T"
+    putWord32le . fromIntegral $ S.length s
+    putByteString s
+  BINUNICODE s -> do
+    putByteString "X"
+    putWord32le . fromIntegral $ S.length s
+    putByteString s
   EMPTY_DICT -> putByteString "}"
   EMPTY_LIST -> putByteString "]"
   EMPTY_TUPLE -> putByteString ")"
+  LIST -> putByteString "l"
   TUPLE -> putByteString "t"
   TUPLE1 -> putByteString "\133"
   TUPLE2 -> putByteString "\134"
@@ -436,6 +445,8 @@ data Value =
   | BinLong Int
   | BinFloat Double
   | BinString S.ByteString
+  | BinUnicode S.ByteString
+  | Memorable Value
   | MarkObject -- Urk, not really a value.
   deriving (Eq, Ord, Show)
 
@@ -446,16 +457,33 @@ data Value =
 unpickle' :: [OpCode] -> Either String Value
 unpickle' xs = execute xs [] (IM.empty)
 
-type Stack = [Value]
+type Stack = [[Value]]
 
 type Memo = IntMap Value
 
+pushS :: Value -> Stack -> Stack
+pushS v (s:ss) = (v:s):ss
+pushS v [] = [[v]]
+popS :: Stack -> (Value, Stack)
+popS ((v:s):ss) = (v,s:ss)
+peekS :: Stack -> Value
+peekS = fst . popS
+popToMark :: Stack -> ([Value], Stack)
+popToMark (s:ss) = (s,ss)
+popN :: Int -> Stack -> ([Value], Stack)
+popN n (s:ss) = let (vs,s') = splitAt n s in (vs, s':ss)
+pushMark :: Stack -> Stack
+pushMark = ([]:)
+toPairs :: [a] -> [(a, a)]
+toPairs (a:b:xs) = (a,b):toPairs xs
+toPairs []       = []
+
 execute :: [OpCode] -> Stack -> Memo -> Either String Value
-execute [] [value] _ = Right value
+execute [] [[value]] _ = Right value
 execute (op:ops) stack memo = case executeOne op stack memo of
-  Left err -> Left err
+  Left err              -> Left err
   Right (stack', memo') -> execute ops stack' memo'
-execute _ _ _ = Left "`execute` unimplemented"
+execute ops stack _ = Left $ "`execute` unimplemented: (stack:  " ++ show stack ++ ", ops: " ++ show ops ++ ")"
 
 executePartial :: [OpCode] -> Stack -> Memo -> (Stack, Memo, [OpCode])
 executePartial [] stack memo = (stack, memo, [])
@@ -463,38 +491,46 @@ executePartial (op:ops) stack memo = case executeOne op stack memo of
   Left _ -> (stack, memo, op:ops)
   Right (stack', memo') -> executePartial ops stack' memo'
 
+
+executeLog :: [OpCode] -> Stack -> Memo -> (Stack, Memo, [OpCode], [(OpCode, Stack)])
+executeLog [] stack memo = (stack, memo, [], [])
+executeLog (op:ops) stack memo = case executeOne op stack memo of
+  Left _ -> (stack, memo, op:ops, [])
+  Right (stack', memo') -> let (s,m,os,ss) = executeLog ops stack' memo' in
+    (s,m,os, (op, stack):ss)
+
 executeOne :: OpCode -> Stack -> Memo -> Either String (Stack, Memo)
-executeOne EMPTY_DICT stack memo = return (Dict M.empty: stack, memo)
-executeOne EMPTY_LIST stack memo = return (List []: stack, memo)
-executeOne EMPTY_TUPLE stack memo = return (Tuple []: stack, memo)
-executeOne (PUT i) (s:stack) memo = return (s:stack, IM.insert i s memo)
+executeOne EMPTY_DICT stack memo = return (pushS (Dict M.empty) stack, memo)
+executeOne EMPTY_LIST stack memo = return (pushS (List []) stack, memo)
+executeOne EMPTY_TUPLE stack memo = return (pushS (Tuple []) stack, memo)
+executeOne (PUT i) stack memo = return (stack, IM.insert i (peekS stack) memo)
 executeOne (GET i) stack memo = executeLookup i stack memo
-executeOne (BINPUT i) (s:stack) memo = return (s:stack, IM.insert i s memo)
+executeOne (BINPUT i) stack memo = return (stack, IM.insert i (peekS stack) memo)
 executeOne (BINGET i) stack memo = executeLookup i stack memo
-executeOne NONE stack memo = return (None:stack, memo)
-executeOne NEWTRUE stack memo = return (Bool True:stack, memo)
-executeOne NEWFALSE stack memo = return (Bool False:stack, memo)
-executeOne (INT i) stack memo = return (BinInt i:stack, memo)
-executeOne (BININT i) stack memo = return (BinInt i:stack, memo)
-executeOne (BININT1 i) stack memo = return (BinInt i:stack, memo)
-executeOne (BININT2 i) stack memo = return (BinInt i:stack, memo)
-executeOne (LONG i) stack memo = return (BinLong i:stack, memo)
-executeOne (LONG1 i) stack memo = return (BinLong i:stack, memo)
-executeOne (FLOAT d) stack memo = return (BinFloat d:stack, memo)
-executeOne (BINFLOAT d) stack memo = return (BinFloat d:stack, memo)
-executeOne (STRING s) stack memo = return (BinString s:stack, memo)
-executeOne (SHORT_BINSTRING s) stack memo = return (BinString s:stack, memo)
-executeOne MARK stack memo = return (MarkObject:stack, memo)
-executeOne TUPLE stack memo = executeTuple [] stack memo
-executeOne TUPLE1 (a:stack) memo = return (Tuple [a]:stack, memo)
-executeOne TUPLE2 (b:a:stack) memo = return (Tuple [a, b]:stack, memo)
-executeOne TUPLE3 (c:b:a:stack) memo = return (Tuple [a, b, c]:stack, memo)
-executeOne DICT stack memo = executeDict [] stack memo
+executeOne NONE stack memo = return (pushS None stack, memo)
+executeOne NEWTRUE stack memo = return (pushS (Bool True) stack, memo)
+executeOne NEWFALSE stack memo = return (pushS (Bool False) stack, memo)
+executeOne (INT i) stack memo = return (pushS (BinInt i) stack, memo)
+executeOne (BININT i) stack memo = return (pushS (BinInt i) stack, memo)
+executeOne (BININT1 i) stack memo = return (pushS (BinInt i) stack, memo)
+executeOne (BININT2 i) stack memo = return (pushS (BinInt i) stack, memo)
+executeOne (LONG i) stack memo = return (pushS (BinLong i) stack, memo)
+executeOne (LONG1 i) stack memo = return (pushS (BinLong i) stack, memo)
+executeOne (FLOAT d) stack memo = return (pushS (BinFloat d) stack, memo)
+executeOne (BINFLOAT d) stack memo = return (pushS (BinFloat d) stack, memo)
+executeOne (STRING s) stack memo = return (pushS (BinString s) stack, memo)
+executeOne (SHORT_BINSTRING s) stack memo = return (pushS (BinString s) stack, memo)
+executeOne MARK stack memo = return (pushMark stack, memo)
+executeOne TUPLE stack memo = executeTuple stack memo
+executeOne TUPLE1 stack memo = executeTupleN 1 stack memo
+executeOne TUPLE2 stack memo = executeTupleN 2 stack memo
+executeOne TUPLE3 stack memo = executeTupleN 3 stack memo
+executeOne DICT stack memo = executeDict stack memo
 executeOne SETITEM stack memo = executeSetitem stack memo
-executeOne SETITEMS stack memo = executeSetitems [] stack memo
-executeOne LIST stack memo = executeList [] stack memo
+executeOne SETITEMS stack memo = executeSetitems stack memo
+executeOne LIST stack memo = executeList stack memo
 executeOne APPEND stack memo = executeAppend stack memo
-executeOne APPENDS stack memo = executeAppends [] stack memo
+executeOne APPENDS stack memo = executeAppends stack memo
 executeOne (PROTO _) stack memo = return (stack, memo)
 executeOne STOP stack memo = Right (stack, memo)
 executeOne op _ _ = Left $ "Can't execute opcode " ++ show op ++ "."
@@ -502,33 +538,35 @@ executeOne op _ _ = Left $ "Can't execute opcode " ++ show op ++ "."
 executeLookup :: Int -> Stack -> Memo -> Either String (Stack, Memo)
 executeLookup k stack memo = case IM.lookup k memo of
   Nothing -> Left "Unknown memo key"
-  Just s -> Right (s:stack, memo)
+  Just s -> Right (pushS s stack, memo)
 
-executeTuple :: Monad m => [Value] -> Stack -> Memo -> m ([Value], Memo)
-executeTuple l (MarkObject:stack) memo = return (Tuple l:stack, memo)
-executeTuple l (a:stack) memo = executeTuple (a : l) stack memo
+executeTuple :: Monad m => Stack -> Memo -> m (Stack, Memo)
+executeTuple stack memo = let (vals, stack') = popToMark stack in return (pushS (Tuple $ reverse vals) stack', memo)
 
-executeDict :: Monad m => [(Value, Value)] -> Stack -> Memo -> m ([Value], Memo)
-executeDict l (MarkObject:stack) memo = return (l `addToDict` Dict M.empty:stack, memo)
-executeDict l (a:b:stack) memo = executeDict ((b, a) : l) stack memo
+executeTupleN :: Monad m => Int -> Stack -> Memo -> m (Stack, Memo)
+executeTupleN n stack memo = let (vals, stack') = popN n stack in return (pushS (Tuple $ reverse vals) stack', memo)
 
-executeList :: Monad m => [Value] -> Stack -> Memo -> m ([Value], Memo)
-executeList l (MarkObject:stack) memo = return (List l:stack, memo)
-executeList l (x:stack) memo = executeList (x : l) stack memo
+executeDict :: Monad m => Stack -> Memo -> m (Stack, Memo)
+executeDict stack memo =
+    let (vals, stack') = popToMark stack in return (pushS (toPairs (reverse vals) `addToDict` Dict M.empty) stack', memo)
 
-executeSetitem :: Monad m => Stack -> Memo -> m ([Value], Memo)
-executeSetitem (v:k:Dict d:stack) memo = return (Dict (M.insert k v d):stack, memo)
+executeList :: Monad m => Stack -> Memo -> m (Stack, Memo)
+executeList stack memo =
+    let (vals, stack') = popToMark stack in return (pushS (List $ reverse vals) stack', memo)
 
-executeSetitems :: Monad m => [(Value, Value)] -> Stack -> Memo -> m ([Value], Memo)
-executeSetitems l (MarkObject:Dict d:stack) memo = return (l `addToDict` Dict d:stack, memo)
-executeSetitems l (a:b:stack) memo = executeSetitems ((b, a) : l) stack memo
+executeSetitem :: Monad m => Stack -> Memo -> m (Stack, Memo)
+executeSetitem stack memo = let ([v, k, Dict d], stack') = popN 3 stack in return (pushS (Dict (M.insert k v d)) stack', memo)
 
-executeAppend :: Monad m => Stack -> Memo -> m ([Value], Memo)
-executeAppend (x:List xs:stack) memo = return (List (xs ++ [x]):stack, memo)
+executeSetitems :: Monad m => Stack -> Memo -> m (Stack, Memo)
+executeSetitems stack memo = let (vals, stack') = popToMark stack
+                                 (Dict d, stack'') = popS stack' in return (pushS (toPairs (reverse vals) `addToDict` Dict d) stack'', memo)
 
-executeAppends :: Monad m => [Value] -> Stack -> Memo -> m ([Value], Memo)
-executeAppends l (MarkObject:List xs:stack) memo = return (List (xs ++ l):stack, memo)
-executeAppends l (x:stack) memo = executeAppends (x : l) stack memo
+executeAppend :: Monad m => Stack -> Memo -> m (Stack, Memo)
+executeAppend stack memo = let ([x, List xs], stack') = popN 2 stack in return (pushS (List (xs ++ [x])) stack', memo)
+
+executeAppends :: Monad m => Stack -> Memo -> m (Stack, Memo)
+executeAppends stack memo = let (vals, stack') = popToMark stack
+                                (List xs, stack'') = popS stack' in return (pushS (List $ xs ++ reverse vals) stack'', memo)
 
 addToDict :: [(Value, Value)] -> Value -> Value
 addToDict l (Dict d) = Dict $ foldl' add d l
@@ -538,19 +576,24 @@ addToDict l (Dict d) = Dict $ foldl' add d l
 -- Pickling (value to opcodes)
 ----------------------------------------------------------------------
 
-newtype Pickler a = Pickler { runP :: WriterT [OpCode] (State (Map Value Int)) a }
-  deriving (Functor, Applicative, Monad, MonadWriter [OpCode], MonadState (Map Value Int))
+data PicklerState = PS { memoMap :: Map Value Int, memoizeNext :: Bool, memoizeAll :: Bool}
+newtype Pickler a = Pickler { runP :: WriterT [OpCode] (State PicklerState) a }
+  deriving (Functor, Applicative, Monad, MonadWriter [OpCode], MonadState PicklerState)
 
 runPickler :: Pickler () -> [OpCode]
-runPickler p = evalState (execWriterT (runP p)) M.empty
+runPickler p = evalState (execWriterT (runP p)) (PS M.empty True True)
+
+stepPickler :: Pickler () -> Map Value Int -> ([OpCode], Map Value Int)
+stepPickler p m = let (o, m') = runState (execWriterT (runP p)) (PS m True True) in (o, memoMap m')
 
 pickle' :: Value -> Pickler ()
 pickle' value = do
-  m <- get
+  m <- gets memoMap
   case M.lookup value m of
     Just k -> tell [BINGET k]
     Nothing -> case value of
       Dict d -> pickleDict d
+      Memorable v  -> modify (\s -> s{memoizeNext = True}) >> pickle' v
       List xs -> pickleList xs
       Tuple xs -> pickleTuple xs
       None -> tell [NONE]
@@ -560,15 +603,17 @@ pickle' value = do
       BinLong i -> pickleBinLong i
       BinFloat d -> pickleBinFloat d
       BinString s -> pickleBinString s
-      x -> error $ "TODO: pickle " ++ show x
+      BinUnicode s -> pickleBinUnicode s
+      x            -> error $ "TODO: pickle " ++ show x
 
 -- TODO actually lookup values in the map, reusing their key.
 binput' :: Value -> Pickler ()
 binput' value = do
-  i <- gets M.size
-  m <- get
-  put (M.insert value i m)
-  tell [BINPUT i]
+  shouldStore <- gets memoizeNext
+  when shouldStore $ do
+    i <- gets $ M.size . memoMap
+    modify $ \s -> s{memoMap = M.insert value i (memoMap s), memoizeNext = memoizeAll s}
+    tell [BINPUT i]
 
 pickleDict :: Map Value Value -> Pickler ()
 pickleDict d = do
@@ -586,9 +631,10 @@ pickleDict d = do
 
 pickleList :: [Value] -> Pickler ()
 pickleList xs = do
+  shouldStore <- gets memoizeNext
+  if shouldStore || null xs then do
   tell [EMPTY_LIST]
   binput' (List xs)
-
   case xs of
     [] -> return ()
     [x] -> pickle' x >> tell [APPEND]
@@ -596,6 +642,13 @@ pickleList xs = do
       tell [MARK]
       mapM_ pickle' xs
       tell [APPENDS]
+   else
+    case xs of
+        [x] -> tell [EMPTY_LIST] >> pickle' x >> tell [APPEND]
+        _ -> do
+            tell [MARK]
+            mapM_ pickle' xs
+            tell [LIST]
 
 pickleTuple :: [Value] -> Pickler ()
 pickleTuple [] = tell [EMPTY_TUPLE]
@@ -636,7 +689,15 @@ pickleBinFloat d = do
 -- TODO depending on the string length, it should not always be a SHORT_BINSTRING
 pickleBinString :: S.ByteString -> Pickler ()
 pickleBinString s = do
-  tell [SHORT_BINSTRING s]
+  tell $ if S.length s < 256 then
+            [SHORT_BINSTRING s]
+            else
+            [BINSTRING s]
+  binput' (BinString s)
+
+pickleBinUnicode :: S.ByteString -> Pickler ()
+pickleBinUnicode s = do
+  tell [BINUNICODE s]
   binput' (BinString s)
 
 ----------------------------------------------------------------------
@@ -656,4 +717,6 @@ dictGet' _ _ = Left "dictGet': not a dict."
 dictGetString :: Value -> S.ByteString -> Either String S.ByteString
 dictGetString (Dict d) s = case M.lookup (BinString s) d of
   Just (BinString s') -> return s'
-  _ -> Left "dictGetString: not a dict, or no such key."
+  _ -> Left "dictGetString: no such key."
+dictGetString _ _ = Left "dictGetString: not a dict."
+
