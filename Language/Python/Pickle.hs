@@ -9,8 +9,8 @@ import Control.Applicative ((<$>), (<*), (*>))
 import Control.Monad.State
 import Control.Monad.Writer
 import qualified Data.ByteString as S
-import Data.Attoparsec hiding (parse, take)
-import qualified Data.Attoparsec as A
+import Data.Attoparsec.ByteString hiding (parse, take)
+import qualified Data.Attoparsec.ByteString as A
 import Data.Attoparsec.ByteString.Char8 (decimal, double, signed)
 import Data.Int (Int32)
 import Data.IntMap (IntMap)
