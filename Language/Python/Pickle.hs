@@ -9,26 +9,34 @@ import Control.Applicative ((<$>), (<*), (*>))
 import Control.Monad.State
 import Control.Monad.Writer
 import qualified Data.ByteString as S
+import qualified Data.ByteString.Builder as SB
+import qualified Data.ByteString.Lazy as LB
 import Data.Attoparsec.ByteString hiding (parse, take)
+import qualified Data.Attoparsec.ByteString.Char8 as AC
 import qualified Data.Attoparsec.ByteString as A
 import Data.Attoparsec.ByteString.Char8 (decimal, double, signed)
 import Data.Int (Int32)
+import Data.Bits
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IM
-import Data.List (foldl')
+import Data.List (foldl', unfoldr)
 import Data.Map (Map)
 import qualified Data.Map as M
-import Data.Serialize.Get (getWord16le, getWord32le, getWord64be, runGet)
+import Data.Serialize.Get (getWord16le, getWord32le, runGet)
+import Data.Serialize.IEEE754
 import Data.Serialize.Put (runPut, putByteString, putWord8, putWord16le, putWord32le, putWord64be, Put)
-import Data.Word (Word32, Word64)
-import Foreign.Marshal.Utils (with)
-import Foreign.Ptr (castPtr)
-import Foreign.Storable (peek)
-import System.IO.Unsafe (unsafePerformIO)
+import qualified Data.Text.Lazy.Builder as TB
+import qualified Data.Text.Lazy as TL
+import Data.Text (Text)
+import Data.Text.Encoding
+import Data.Word (Word32, Word64, Word16, Word8)
+
+
+
 
 -- | Parse a pickled object to a list of opcodes.
 parse :: S.ByteString -> Either String [OpCode]
-parse = parseOnly (many1 $ choice opcodes)
+parse = parseOnly (many1 (choice opcodes) <* endOfInput)
 
 -- | Unpickle (i.e. deserialize) a Python object. Protocols 0, 1, and 2 are
 -- supported.
@@ -60,6 +68,7 @@ opcodes =
   , none
   , newtrue, newfalse
   , unicode, binunicode
+  , binbytes, short_binbytes
   , float, binfloat
   , empty_list, append, appends, list
   , empty_tuple, tuple, tuple1, tuple2, tuple3
@@ -78,7 +87,7 @@ int, binint, binint1, binint2, long, long1, long4 :: Parser OpCode
 int = string "I" *> (INT <$> decimalInt)
 binint = string "J" *> (BININT <$> int4)
 binint1 = string "K" *> (BININT1 . fromIntegral <$> anyWord8)
-binint2 = string "M" *> (BININT2 <$> uint2)
+binint2 = string "M" *> (BININT2 . fromIntegral <$> uint2)
 long = string "L" *> (LONG <$> decimalLong)
 long1 = string "\138" *> (LONG1 <$> decodeLong1) -- same as \x8a
 long4 = string "\139" *> (LONG4 <$> decodeLong4) -- same as \x8b
@@ -87,13 +96,13 @@ long4 = string "\139" *> (LONG4 <$> decodeLong4) -- same as \x8b
 
 string', binstring, short_binstring :: Parser OpCode
 string' = string "S" *> (STRING <$> stringnl)
-binstring = string "T" *> (BINSTRING <$> undefined)
-short_binstring = do
-  _ <- string "U"
-  i <- fromIntegral <$> anyWord8
-  s <- A.take i
-  return $ SHORT_BINSTRING s
+binstring = string "T" *> (BINSTRING <$> string4)
+short_binstring = string "U" *> (SHORT_BINSTRING <$> string1)
 
+-- Bytes
+binbytes, short_binbytes :: Parser OpCode
+binbytes = string "B" *> (BINBYTES <$> bytes4)
+short_binbytes = string "C" *> (SHORT_BINBYTES <$> bytes1)
 -- None
 
 none :: Parser OpCode
@@ -102,16 +111,16 @@ none = string "N" *> return NONE
 -- Booleans
 
 true, false, newtrue, newfalse :: Parser OpCode
-true = string "I01" *> return NEWTRUE
-false = string "I00" *> return NEWFALSE
+true = string "I01\n" *> return NEWTRUE
+false = string "I00\n" *> return NEWFALSE
 newtrue = string "\136" *> return NEWTRUE -- same as \x88
 newfalse = string "\137" *> return NEWFALSE -- same as \x89
 
 -- Unicode strings
 
 unicode, binunicode :: Parser OpCode
-unicode = string "V" *> (UNICODE <$> undefined)
-binunicode = string "X" *> (BINUNICODE <$> undefined)
+unicode = string "V" *> (UNICODE <$> unicodestringnl)
+binunicode = string "X" *> (BINUNICODE <$> unicodestring4)
 
 -- Floats
 
@@ -157,25 +166,25 @@ popmark = string "1" *> return POP_MARK
 get', binget, long_binget, put', binput, long_binput :: Parser OpCode
 get' = string "g" *> (GET <$> decimalInt)
 binget = string "h" *> (BINGET . fromIntegral <$> anyWord8)
-long_binget = string "j" *> (LONG_BINGET <$> undefined)
+long_binget = string "j" *> (LONG_BINGET . fromIntegral <$> uint4)
 put' = string "p" *> (PUT <$> decimalInt)
 binput = string "q" *> (BINPUT . fromIntegral <$> anyWord8)
-long_binput = string "r" *> (LONG_BINPUT <$> undefined)
+long_binput = string "r" *> (LONG_BINPUT . fromIntegral <$> uint4)
 
 -- Extension registry (predefined objects)
 
 ext1, ext2, ext4 :: Parser OpCode
-ext1 = string "\130" *> (EXT1 <$> undefined) -- same as \x82
-ext2 = string "\131" *> (EXT2 <$> undefined) -- same as \x83
-ext4 = string "\132" *> (EXT4 <$> undefined) -- same as \x84
+ext1 = string "\130" *> (EXT1 . fromIntegral <$> uint1) -- same as \x82
+ext2 = string "\131" *> (EXT2 . fromIntegral <$> uint2) -- same as \x83
+ext4 = string "\132" *> (EXT4 . fromIntegral <$> uint4) -- same as \x84
 
 -- Various
 
 global, reduce, build, inst, obj, newobj :: Parser OpCode
-global = string "c" *> (uncurry GLOBAL <$> undefined)
+global = string "c" *> (GLOBAL <$> stringnl <*> stringnl)
 reduce = string "R" *> return REDUCE
 build = string "b" *> return BUILD
-inst = string "i" *> (uncurry INST <$> undefined)
+inst = string "i" *> (INST <$> stringnl_noescape <*> stringnl_noescape)
 obj = string "o" *> return OBJ
 newobj = string "\129" *> return NEWOBJ -- same as \x81
 
@@ -188,7 +197,7 @@ stop = string "." *> return STOP
 -- Persistent IDs
 
 persid, binpersid :: Parser OpCode
-persid = string "P" *> (PERSID <$> undefined)
+persid = string "P" *> (PERSID <$> stringnl_noescape)
 binpersid = string "Q" *> return BINPERSID
 
 -- Basic parsers
@@ -197,40 +206,141 @@ decimalInt :: Parser Int
 decimalInt = signed decimal <* string "\n"
 
 -- TODO document the differences with Python's representation.
+doubleFloat :: Parser Double
 doubleFloat = double <* string "\n"
 
-decimalLong :: Parser Int
+decimalLong :: Parser Integer
 decimalLong = signed decimal <* string "L\n"
 
-decodeLong1 :: Parser Int
+decodeLong1 :: Parser Integer
 decodeLong1 = do
   n <- fromIntegral <$> anyWord8
   if n > 0
     then do
       ns <- A.take n
-      let a = fst . fst $ toLong ns
+      let a = toLong ns
       return $ if S.last ns > 127 then negate $ 256 ^ S.length ns - a else a
     else return 0
-  where toLong = S.mapAccumL (\(a, b) w -> ((a + 256 ^ b * fromIntegral w, b + 1), w)) (0, 0)
+  where toLong = S.foldr' (\w a -> (a * 256 + toInteger w)) 0
 
-decodeLong4 = undefined -- TODO
+integerToInts :: Integer -> [Int]
+integerToInts = unfoldr folder
+      where
+       intMax = toInteger (maxBound :: Int)
+       folder x | x > intMax = Just (maxBound, x - intMax)
+                | x > 0 = Just (fromInteger x, 0)
+                | otherwise = Nothing
+decodeLong4 :: Parser Integer
+decodeLong4 = do
+  n' <- runGet getWord32le <$> A.take 4
+  n <- either fail return n'
+  if n > 0
+    then do
+      ns <- mapM A.take . integerToInts $ toInteger n
+      let a = toLong ns
+      return $ if (S.last .last) ns > 127 then negate $ 256 ^ (sum . map S.length) ns - a else a
+    else return 0
+  where toLong = foldr (\n a -> a * toInteger (maxBound :: Int) + S.foldr' (\w a' -> a' * 256 + toInteger w) 0 n) 0
 
--- TODO escaping not implemented.
-stringnl = choice
-  [ string "'" *> takeTill (== 39) <* string "'\n"
-  ]
+unicodestring4 :: Parser Text
+unicodestring4 = do
+  n' <- runGet getWord32le <$> A.take 4
+  n <- either fail return n'
+  if n > 0 then decodeUtf8 <$> A.take (fromIntegral n) else return mempty
+string1 :: Parser S.ByteString
+string1 = do
+  n <- fromIntegral <$> anyWord8
+  A.take n
+string4 :: Parser S.ByteString
+string4 = do
+  n' <- runGet getWord32le <$> A.take 4
+  n <- either fail return n'
+  if n > 0 then A.take (fromIntegral n) else return mempty
+stringnl :: Parser S.ByteString
+stringnl = do
+  open <- quote
+  LB.toStrict . SB.toLazyByteString . mconcat <$> manyTill (charOrEscape open) (AC.char open)  <* AC.char '\n'
+      where 
+        charOrEscape q = choice [unescapedChunk, escapeSeq]
+          where
+            unescapedChunk = SB.byteString <$> AC.takeWhile1 (\c -> c /= '\\' && c /= q)
+            escapeSeq = do
+              c <- AC.char '\\' *> AC.peekChar'
+              case c of
+                '\\' -> "\\" <$ anyWord8
+                '\'' -> "'" <$ anyWord8
+                '"'  -> "\"" <$ anyWord8
+                'a'  -> "\a" <$ anyWord8
+                'b'  -> "\b" <$ anyWord8
+                'f'  -> "\f" <$ anyWord8
+                'n'  -> "\n" <$ anyWord8
+                'r'  -> "\r" <$ anyWord8
+                't'  -> "\t" <$ anyWord8
+                'v'  -> "\v" <$ anyWord8
+                'x'  -> SB.word8 <$> hexadecimalExact 2
+                x | isOctDigit_w8 (fromEnum x) -> SB.word8 <$> octalLim 3
+                  | otherwise -> fail $ "Unsupported escape: \\" ++ show x
+        quote = AC.satisfy $ \x -> x == '\'' || x == '"'
+unicodestringnl :: Parser Text
+unicodestringnl = do
+  open <- quote
+  TL.toStrict . TB.toLazyText . mconcat <$> manyTill (charOrEscape open) (AC.char open)  <* AC.char '\n'
+      where 
+        charOrEscape q = choice [unescapedChunk, escapeSeq]
+          where
+            unescapedChunk = do
+              chunk <- decodeUtf8' <$> AC.takeWhile1 (\c -> c /= '\\' && c /= q)
+              either (fail . show) (return . TB.fromText) chunk
+            escapeSeq = do
+              c <- AC.char '\\' *> AC.anyChar
+              case c of
+                'u' -> TB.singleton . toEnum <$> hexadecimalExact 4
+                'U' -> TB.singleton . toEnum <$> hexadecimalExact 8
+                x -> return $ "\\" <> TB.singleton x
+        quote = AC.satisfy $ \x -> x == '\'' || x == '"'
+octalLim :: (Bits a, Integral a) => Int -> Parser a
+octalLim maxcnt = fst . snd <$> A.runScanner (0,maxcnt) step
+  where step (total, cnt) w = if isOctDigit_w8 w && cnt >= 0 then Just ((total `shiftL` 3) .|. fromIntegral (w - 48), cnt - 1) else Nothing
+hexadecimalLim :: (Bits a, Integral a) => Int -> Parser a
+hexadecimalLim maxcnt = fst . snd <$> A.runScanner (0,maxcnt) step
+  where step (total, cnt) w = if isHexDigit w && cnt >= 0 then Just (step' total w, cnt - 1) else Nothing
+        isHexDigit w = (w >= 48 && w <= 57) ||
+                      (w >= 97 && w <= 102) ||
+                      (w >= 65 && w <= 70)
+        step' a w | w >= 48 && w <= 57  = (a `shiftL` 4) .|. fromIntegral (w - 48)
+                | w >= 97             = (a `shiftL` 4) .|. fromIntegral (w - 87)
+                | otherwise           = (a `shiftL` 4) .|. fromIntegral (w - 55)
 
+hexadecimalExact :: (Bits a, Integral a) => Int -> Parser a
+hexadecimalExact maxcnt = do 
+  (res, finalCount) <- snd <$> A.runScanner (0,maxcnt) step
+  if finalCount > 0 then fail "Malformed decimal" else return res
+  where step (total, cnt) w = if isHexDigit w && cnt >= 0 then Just (step' total w, cnt - 1) else Nothing
+        isHexDigit w = (w >= 48 && w <= 57) ||
+                        (w >= 97 && w <= 102) ||
+                        (w >= 65 && w <= 70)
+        step' a w | w >= 48 && w <= 57  = (a `shiftL` 4) .|. fromIntegral (w - 48)
+                | w >= 97             = (a `shiftL` 4) .|. fromIntegral (w - 87)
+                | otherwise           = (a `shiftL` 4) .|. fromIntegral (w - 55)
+
+isOctDigit_w8 :: (Ord a, Num a) => a -> Bool
+isOctDigit_w8 w = w - 48 <= 7
+
+stringnl_noescape :: Parser S.ByteString
+stringnl_noescape = takeTill (== toEnum 10)
 float8 :: Parser Double
 float8 = do
-  w <- runGet getWord64be <$> A.take 8
-  case w of
-    Left err -> fail err
-    Right x -> return $ coerce x
-  where
-  coerce :: Word64 -> Double
-  coerce x = unsafePerformIO $ with x $ \p ->
-    peek (castPtr p) :: IO Double
+  w <- runGet getFloat64be <$> A.take 8
+  either fail return w
 
+bytes1 :: Parser S.ByteString
+bytes1 = do
+  w <- anyWord8
+  A.take (fromIntegral w)
+bytes4 :: Parser S.ByteString
+bytes4 = do
+  w <- runGet getWord32le <$> A.take 4
+  either fail (A.take . fromIntegral) w
 int4 :: Parser Int
 int4 = do
   w <- runGet getWord32le <$> A.take 4
@@ -239,16 +349,18 @@ int4 = do
     Right x -> return . fromIntegral $ coerce x
   where
   coerce :: Word32 -> Int32
-  coerce x = unsafePerformIO $ with x $ \p ->
-    peek (castPtr p) :: IO Int32
+  coerce = fromIntegral
 
-uint2 :: Parser Int
+uint1 :: Parser Word8
+uint1 = anyWord8
+uint2 :: Parser Word16
 uint2 = do
   w <- runGet getWord16le <$> A.take 2
   case w of
     Left err -> fail err
     Right x -> return $ fromIntegral x
-
+uint4 :: Parser Word32
+uint4 = runGet getWord32le <$> A.take 4 >>= either fail return
 ----------------------------------------------------------------------
 -- Pickle opcodes serialization
 ----------------------------------------------------------------------
@@ -276,8 +388,9 @@ serialize opcode = case opcode of
     putByteString s
   BINUNICODE s -> do
     putByteString "X"
-    putWord32le . fromIntegral $ S.length s
-    putByteString s
+    let s' = encodeUtf8 s
+    putWord32le . fromIntegral $ S.length s'
+    putByteString s'
   EMPTY_DICT -> putByteString "}"
   EMPTY_LIST -> putByteString "]"
   EMPTY_TUPLE -> putByteString ")"
@@ -294,16 +407,12 @@ serialize opcode = case opcode of
   x -> error $ "serialize: " ++ show x
 
 putFloat8 :: Double -> Put
-putFloat8 d = putWord64be (coerce d)
-    where
-    coerce :: Double -> Word64
-    coerce x = unsafePerformIO $ with x $ \p ->
-      peek (castPtr p) :: IO Word64
+putFloat8 d = putFloat64be d
 
 putUint2 :: Int -> Put
 putUint2 d = putWord16le (fromIntegral d)
 
-encodeLong1 :: Int -> Put
+encodeLong1 :: Integer -> Put
 encodeLong1 i = do
   -- TODO is it possible to know xs length without really constructing xs?
   let xs = f $ abs i
@@ -311,7 +420,7 @@ encodeLong1 i = do
           | otherwise = let (n, r) = j `divMod` 256 in fromIntegral r : f n
       e = 256 ^ length xs
   if i < 0
-    then do
+    then
       if (abs i) > e `div` 2
         then do
           putWord8 (fromIntegral $ length xs + 1)
@@ -340,9 +449,9 @@ data OpCode =
   | BININT Int
   | BININT1 Int
   | BININT2 Int
-  | LONG Int
-  | LONG1 Int
-  | LONG4 Int
+  | LONG Integer
+  | LONG1 Integer
+  | LONG4 Integer
 
   -- Strings
   | STRING S.ByteString
@@ -357,9 +466,11 @@ data OpCode =
   | NEWFALSE
 
   -- Unicode strings
-  | UNICODE S.ByteString -- TODO (use Text ?)
-  | BINUNICODE S.ByteString
-
+  | UNICODE Text -- TODO (use Text ?)
+  | BINUNICODE Text
+  -- Bytes
+  | BINBYTES S.ByteString
+  | SHORT_BINBYTES S.ByteString
   -- Floats
   | FLOAT Double
   | BINFLOAT Double
@@ -442,12 +553,12 @@ data Value =
   | None
   | Bool Bool
   | BinInt Int
-  | BinLong Int
+  | BinLong Integer
   | BinFloat Double
   | BinString S.ByteString
-  | BinUnicode S.ByteString
+  | BinUnicode Text
+  | BinBytes S.ByteString
   | Memorable Value
-  | MarkObject -- Urk, not really a value.
   deriving (Eq, Ord, Show)
 
 ----------------------------------------------------------------------
@@ -461,115 +572,181 @@ type Stack = [[Value]]
 
 type Memo = IntMap Value
 
-pushS :: Value -> Stack -> Stack
-pushS v (s:ss) = (v:s):ss
-pushS v [] = [[v]]
-popS :: Stack -> (Value, Stack)
-popS ((v:s):ss) = (v,s:ss)
-peekS :: Stack -> Value
-peekS = fst . popS
-popToMark :: Stack -> ([Value], Stack)
-popToMark (s:ss) = (s,ss)
-popN :: Int -> Stack -> ([Value], Stack)
-popN n (s:ss) = let (vs,s') = splitAt n s in (vs, s':ss)
-pushMark :: Stack -> Stack
-pushMark = ([]:)
-toPairs :: [a] -> [(a, a)]
-toPairs (a:b:xs) = (a,b):toPairs xs
-toPairs []       = []
+data UnpicklerState = US {usStack :: Stack, usMemo :: Memo}
+newtype Unpickler a = UnPickler { runUnP :: StateT UnpicklerState (Either String) a}
+  deriving (Functor, Applicative, Monad, MonadState UnpicklerState)
+
+pushS :: Value -> Unpickler ()
+pushS v = modify $ \s -> s{usStack = push' (usStack s)}
+  where
+    push' (s:ss) = (v:s):ss
+    push' [] = [[v]]
+popS :: Unpickler Value
+popS = do 
+  s <- get
+  case usStack s of
+    ((v:topStack):ss) -> do
+      put s{usStack = topStack:ss}
+      return v
+    _ -> fail "popS: Tried to pop an empty stack"
+peekS :: Unpickler Value
+peekS = do
+  s <- gets usStack
+  case s of
+    ((v:_):_) -> return v
+    _ -> fail "peekS: Tried to pop an empty stack"
+popToMark :: Unpickler [Value]
+popToMark = do
+  s <- get
+  case usStack s of 
+    (s':ss) -> do
+      put s{usStack = ss}
+      return $ reverse s'
+    _ -> fail "popToMark: Tried to pop an empty stack"
+
+popN :: Int -> Unpickler [Value]
+popN n = do
+  s <- get
+  case usStack s of
+    (s':ss) | length s' >= n -> do
+      let (vs, s'') = splitAt n s'
+      put s{usStack = s'':ss}
+      return $ reverse vs
+    _ -> fail "popN: Tried to pop an insufficient stack"
+pushMark :: Unpickler ()
+pushMark = modify $ \s -> s{usStack = []:usStack s}
+
+remember :: Int -> Value -> Unpickler ()
+remember i v = modify $ \s -> s{usMemo = IM.insert i v $ usMemo s}
+toPairs :: Monad m => [a] -> m [(a, a)]
+toPairs (a:b:xs) = ((a,b):) <$> toPairs xs
+toPairs [_] = fail "toPairs: Can't pair up odd list"
+toPairs []       = return []
 
 execute :: [OpCode] -> Stack -> Memo -> Either String Value
 execute [] [[value]] _ = Right value
-execute (op:ops) stack memo = case executeOne op stack memo of
+execute (op:ops) stack memo = case flip runStateT (US stack memo) . runUnP $ executeOne op of
   Left err              -> Left err
-  Right (stack', memo') -> execute ops stack' memo'
+  Right ((), US stack' memo') -> execute ops stack' memo'
 execute ops stack _ = Left $ "`execute` unimplemented: (stack:  " ++ show stack ++ ", ops: " ++ show ops ++ ")"
 
 executePartial :: [OpCode] -> Stack -> Memo -> (Stack, Memo, [OpCode])
 executePartial [] stack memo = (stack, memo, [])
-executePartial (op:ops) stack memo = case executeOne op stack memo of
+executePartial (op:ops) stack memo = case flip runStateT (US stack memo) . runUnP $ executeOne op of
   Left _ -> (stack, memo, op:ops)
-  Right (stack', memo') -> executePartial ops stack' memo'
+  Right ((), US stack' memo') -> executePartial ops stack' memo'
 
 
 executeLog :: [OpCode] -> Stack -> Memo -> (Stack, Memo, [OpCode], [(OpCode, Stack)])
 executeLog [] stack memo = (stack, memo, [], [])
-executeLog (op:ops) stack memo = case executeOne op stack memo of
+executeLog (op:ops) stack memo = case flip runStateT (US stack memo) . runUnP $ executeOne op of
   Left _ -> (stack, memo, op:ops, [])
-  Right (stack', memo') -> let (s,m,os,ss) = executeLog ops stack' memo' in
+  Right ((), US stack' memo') -> let (s,m,os,ss) = executeLog ops stack' memo' in
     (s,m,os, (op, stack):ss)
 
-executeOne :: OpCode -> Stack -> Memo -> Either String (Stack, Memo)
-executeOne EMPTY_DICT stack memo = return (pushS (Dict M.empty) stack, memo)
-executeOne EMPTY_LIST stack memo = return (pushS (List []) stack, memo)
-executeOne EMPTY_TUPLE stack memo = return (pushS (Tuple []) stack, memo)
-executeOne (PUT i) stack memo = return (stack, IM.insert i (peekS stack) memo)
-executeOne (GET i) stack memo = executeLookup i stack memo
-executeOne (BINPUT i) stack memo = return (stack, IM.insert i (peekS stack) memo)
-executeOne (BINGET i) stack memo = executeLookup i stack memo
-executeOne NONE stack memo = return (pushS None stack, memo)
-executeOne NEWTRUE stack memo = return (pushS (Bool True) stack, memo)
-executeOne NEWFALSE stack memo = return (pushS (Bool False) stack, memo)
-executeOne (INT i) stack memo = return (pushS (BinInt i) stack, memo)
-executeOne (BININT i) stack memo = return (pushS (BinInt i) stack, memo)
-executeOne (BININT1 i) stack memo = return (pushS (BinInt i) stack, memo)
-executeOne (BININT2 i) stack memo = return (pushS (BinInt i) stack, memo)
-executeOne (LONG i) stack memo = return (pushS (BinLong i) stack, memo)
-executeOne (LONG1 i) stack memo = return (pushS (BinLong i) stack, memo)
-executeOne (FLOAT d) stack memo = return (pushS (BinFloat d) stack, memo)
-executeOne (BINFLOAT d) stack memo = return (pushS (BinFloat d) stack, memo)
-executeOne (STRING s) stack memo = return (pushS (BinString s) stack, memo)
-executeOne (SHORT_BINSTRING s) stack memo = return (pushS (BinString s) stack, memo)
-executeOne MARK stack memo = return (pushMark stack, memo)
-executeOne TUPLE stack memo = executeTuple stack memo
-executeOne TUPLE1 stack memo = executeTupleN 1 stack memo
-executeOne TUPLE2 stack memo = executeTupleN 2 stack memo
-executeOne TUPLE3 stack memo = executeTupleN 3 stack memo
-executeOne DICT stack memo = executeDict stack memo
-executeOne SETITEM stack memo = executeSetitem stack memo
-executeOne SETITEMS stack memo = executeSetitems stack memo
-executeOne LIST stack memo = executeList stack memo
-executeOne APPEND stack memo = executeAppend stack memo
-executeOne APPENDS stack memo = executeAppends stack memo
-executeOne (PROTO _) stack memo = return (stack, memo)
-executeOne STOP stack memo = Right (stack, memo)
-executeOne op _ _ = Left $ "Can't execute opcode " ++ show op ++ "."
+executeOne :: OpCode -> Unpickler ()
+executeOne EMPTY_DICT = pushS (Dict M.empty)
+executeOne EMPTY_LIST = pushS (List [])
+executeOne EMPTY_TUPLE = pushS (Tuple [])
+executeOne (PUT i) = peekS >>= remember i
+executeOne (GET i) = executeLookup i
+executeOne (BINPUT i) = peekS >>= remember i
+executeOne (BINGET i) = executeLookup i
+executeOne NONE = pushS None
+executeOne NEWTRUE = pushS (Bool True)
+executeOne NEWFALSE = pushS (Bool False)
+executeOne (INT i) = pushS (BinInt i)
+executeOne (BININT i) = pushS (BinInt i)
+executeOne (BININT1 i) = pushS (BinInt i)
+executeOne (BININT2 i) = pushS (BinInt i)
+executeOne (LONG i) = pushS (BinLong i)
+executeOne (LONG1 i) = pushS (BinLong i)
+executeOne (FLOAT d) = pushS (BinFloat d)
+executeOne (BINFLOAT d) = pushS (BinFloat d)
+executeOne (STRING s) = pushS (BinString s)
+executeOne (SHORT_BINSTRING s) = pushS (BinString s)
+executeOne (BINUNICODE s) = pushS (BinUnicode s)
+executeOne (UNICODE s) = pushS (BinUnicode s)
+executeOne (BINBYTES b) = pushS (BinBytes b)
+executeOne (SHORT_BINBYTES b) = pushS (BinBytes b)
+executeOne MARK = pushMark
+executeOne TUPLE = executeTuple
+executeOne TUPLE1 = executeTupleN 1
+executeOne TUPLE2 = executeTupleN 2
+executeOne TUPLE3 = executeTupleN 3
+executeOne DICT = executeDict
+executeOne SETITEM = executeSetitem
+executeOne SETITEMS = executeSetitems
+executeOne LIST = executeList
+executeOne APPEND = executeAppend
+executeOne APPENDS = executeAppends
+executeOne (PROTO _) = return ()
+executeOne STOP = return ()
+executeOne op = fail $ "Can't execute opcode " ++ show op ++ "."
 
-executeLookup :: Int -> Stack -> Memo -> Either String (Stack, Memo)
-executeLookup k stack memo = case IM.lookup k memo of
-  Nothing -> Left "Unknown memo key"
-  Just s -> Right (pushS s stack, memo)
+executeLookup :: Int -> Unpickler ()
+executeLookup k = do 
+  memo <- gets usMemo
+  case IM.lookup k memo of
+    Nothing -> fail "Unknown memo key"
+    Just s -> pushS s
 
-executeTuple :: Monad m => Stack -> Memo -> m (Stack, Memo)
-executeTuple stack memo = let (vals, stack') = popToMark stack in return (pushS (Tuple $ reverse vals) stack', memo)
+executeTuple :: Unpickler ()
+executeTuple = do
+  vals <- popToMark
+  pushS (Tuple vals)
 
-executeTupleN :: Monad m => Int -> Stack -> Memo -> m (Stack, Memo)
-executeTupleN n stack memo = let (vals, stack') = popN n stack in return (pushS (Tuple $ reverse vals) stack', memo)
+executeTupleN :: Int -> Unpickler ()
+executeTupleN n = do
+  vals <- popN n
+  pushS (Tuple vals)
 
-executeDict :: Monad m => Stack -> Memo -> m (Stack, Memo)
-executeDict stack memo =
-    let (vals, stack') = popToMark stack in return (pushS (toPairs (reverse vals) `addToDict` Dict M.empty) stack', memo)
+executeDict :: Unpickler ()
+executeDict  = do
+  vals <- popToMark >>= toPairs
+  pushS (vals `addToDict` M.empty)
 
-executeList :: Monad m => Stack -> Memo -> m (Stack, Memo)
-executeList stack memo =
-    let (vals, stack') = popToMark stack in return (pushS (List $ reverse vals) stack', memo)
+executeList :: Unpickler ()
+executeList = do
+  vals <- popToMark
+  pushS (List vals)
 
-executeSetitem :: Monad m => Stack -> Memo -> m (Stack, Memo)
-executeSetitem stack memo = let ([v, k, Dict d], stack') = popN 3 stack in return (pushS (Dict (M.insert k v d)) stack', memo)
+executeSetitem :: Unpickler ()
+executeSetitem = do
+  v <- popS
+  k <- popS
+  o <- popS
+  case o of
+    Dict d -> pushS (Dict (M.insert k v d))
+    _ -> fail "executeSetItem: Can't push into a non-dictionary"
 
-executeSetitems :: Monad m => Stack -> Memo -> m (Stack, Memo)
-executeSetitems stack memo = let (vals, stack') = popToMark stack
-                                 (Dict d, stack'') = popS stack' in return (pushS (toPairs (reverse vals) `addToDict` Dict d) stack'', memo)
+executeSetitems :: Unpickler ()
+executeSetitems = do
+  vals <- popToMark
+  vals' <- toPairs vals
+  o <- popS
+  case o of
+    Dict d -> pushS $ vals' `addToDict` d
+    _ -> fail "executeSetitems: Can't push into a non-dictionary"
 
-executeAppend :: Monad m => Stack -> Memo -> m (Stack, Memo)
-executeAppend stack memo = let ([x, List xs], stack') = popN 2 stack in return (pushS (List (xs ++ [x])) stack', memo)
+executeAppend :: Unpickler ()
+executeAppend = do
+  x <- popS
+  o <- popS
+  case o of
+    List ls -> pushS (List $ ls ++ [x])
+    _ -> fail "executeAppend: Can't append into a non-list"
 
-executeAppends :: Monad m => Stack -> Memo -> m (Stack, Memo)
-executeAppends stack memo = let (vals, stack') = popToMark stack
-                                (List xs, stack'') = popS stack' in return (pushS (List $ xs ++ reverse vals) stack'', memo)
+executeAppends :: Unpickler ()
+executeAppends = do
+  xs <- popToMark
+  o <- popS
+  case o of
+    List ls -> pushS (List $ ls ++ xs)
+    _ -> fail "executeAppends: Can't append into a non-list"
 
-addToDict :: [(Value, Value)] -> Value -> Value
-addToDict l (Dict d) = Dict $ foldl' add d l
+addToDict :: [(Value, Value)] -> Map Value Value -> Value
+addToDict l d = Dict $ foldl' add d l
   where add d' (k, v) = M.insert k v d'
 
 ----------------------------------------------------------------------
@@ -678,15 +855,13 @@ pickleBinInt i | i >= 0 && i < 256 = tell [BININT1 i]
                | i >= 256 && i < 65536 = tell [BININT2 i]
                | otherwise = tell [BININT i]
 
-pickleBinLong :: Int -> Pickler ()
+pickleBinLong :: Integer -> Pickler ()
 pickleBinLong i = tell [LONG1 i] -- TODO LONG/LONG1/LONG4
 
 -- TODO probably depends on the float range
 pickleBinFloat :: Double -> Pickler ()
-pickleBinFloat d = do
-  tell [BINFLOAT d]
+pickleBinFloat d = tell [BINFLOAT d]
 
--- TODO depending on the string length, it should not always be a SHORT_BINSTRING
 pickleBinString :: S.ByteString -> Pickler ()
 pickleBinString s = do
   tell $ if S.length s < 256 then
@@ -695,10 +870,10 @@ pickleBinString s = do
             [BINSTRING s]
   binput' (BinString s)
 
-pickleBinUnicode :: S.ByteString -> Pickler ()
+pickleBinUnicode :: Text -> Pickler ()
 pickleBinUnicode s = do
   tell [BINUNICODE s]
-  binput' (BinString s)
+  binput' (BinUnicode s)
 
 ----------------------------------------------------------------------
 -- Manipulate Values

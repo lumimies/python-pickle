@@ -17,7 +17,6 @@ import System.Process (rawSystem)
 import Test.HUnit (assertEqual, assertFailure)
 import Test.Framework (defaultMain, testGroup, Test)
 import Test.Framework.Providers.HUnit (testCase)
-
 import Language.Python.Pickle
 
 main :: IO ()
@@ -69,7 +68,7 @@ expressions =
   , ("[]", List [])
   , ("[1]", List [BinInt 1])
   , ("[1, 2]", List [BinInt 1, BinInt 2])
-
+  , ("[True, 0, 1, False]", List [Bool True, BinInt 0, BinInt 1, Bool False])
   , ("()", Tuple [])
   , ("(1,)", Tuple [BinInt 1])
   , ("(1, 2)", Tuple [BinInt 1, BinInt 2])
@@ -98,7 +97,7 @@ expressions =
   ++ map (show &&& BinInt) ints
   ++ map (show &&& BinFloat) doubles
   ++ map (quote . C.unpack &&& BinString) strings
-  ++ map ((++ "L") . show &&& BinLong) ints
+  ++ map ((++ "L") . show &&& BinLong . toInteger) ints
 
 ints :: [Int]
 ints =
@@ -117,3 +116,4 @@ strings =
 
 quote :: IsString [a] => [a] -> [a]
 quote s = concat ["'", s, "'"]
+

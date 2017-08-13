@@ -20,6 +20,7 @@ library
   build-depends:       attoparsec == 0.13.*,
                        base == 4.*,
                        bytestring == 0.10.*,
+                       text >= 1.2,
                        cereal == 0.5.*,
                        containers == 0.5.*,
                        mtl == 2.2.*
