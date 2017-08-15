@@ -1,5 +1,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE TypeApplications #-}
 -- | Very partial implementation of the Python Pickle Virtual Machine
 -- (protocol 2): i.e. parses pickled data into opcodes, then executes the
 -- opcodes to construct a (Haskell representation of a) Python object.
@@ -9,13 +11,18 @@ import Control.Applicative ((<$>), (<*), (*>))
 import Control.Monad.State
 import Control.Monad.Writer
 import qualified Data.ByteString as S
+import qualified Data.ByteString.Char8 as SC
 import qualified Data.ByteString.Builder as SB
+import qualified Data.ByteString.Builder.Prim as SBP
 import qualified Data.ByteString.Lazy as LB
 import Data.Attoparsec.ByteString hiding (parse, take)
 import qualified Data.Attoparsec.ByteString.Char8 as AC
 import qualified Data.Attoparsec.ByteString as A
+import qualified Data.Attoparsec.Binary as A
 import Data.Attoparsec.ByteString.Char8 (decimal, double, signed)
 import Data.Int (Int32)
+import qualified Data.Char as C
+import Numeric.Natural
 import Data.Bits
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IM
@@ -24,13 +31,13 @@ import Data.Map (Map)
 import qualified Data.Map as M
 import Data.Serialize.Get (getWord16le, getWord32le, runGet)
 import Data.Serialize.IEEE754
-import Data.Serialize.Put (runPut, putByteString, putWord8, putWord16le, putWord32le, putWord64be, Put)
 import qualified Data.Text.Lazy.Builder as TB
 import qualified Data.Text.Lazy as TL
 import Data.Text (Text)
+import qualified Data.Text as T
 import Data.Text.Encoding
 import Data.Word (Word32, Word64, Word16, Word8)
-
+import GHC.Generics
 
 
 
@@ -47,10 +54,7 @@ unpickle s = do
 
 -- | Pickle (i.e. serialize) a Python object. Protocol 2 is used.
 pickle :: Value -> S.ByteString
-pickle value = runPut $ do
-  putByteString "\128\STX"
-  mapM_ serialize . runPickler $ pickle' value
-  putByteString "."
+pickle value = LB.toStrict . SB.toLazyByteString . mconcat . map serialize . (PROTO 2:) . (++ [STOP]) . runPickler $ pickle' value
 
 ----------------------------------------------------------------------
 -- Pickle opcodes parser
@@ -86,8 +90,8 @@ opcodes =
 int, binint, binint1, binint2, long, long1, long4 :: Parser OpCode
 int = string "I" *> (INT <$> decimalInt)
 binint = string "J" *> (BININT <$> int4)
-binint1 = string "K" *> (BININT1 . fromIntegral <$> anyWord8)
-binint2 = string "M" *> (BININT2 . fromIntegral <$> uint2)
+binint1 = string "K" *> (BININT1 <$> anyWord8)
+binint2 = string "M" *> (BININT2 <$> A.anyWord16le)
 long = string "L" *> (LONG <$> decimalLong)
 long1 = string "\138" *> (LONG1 <$> decodeLong1) -- same as \x8a
 long4 = string "\139" *> (LONG4 <$> decodeLong4) -- same as \x8b
@@ -164,10 +168,10 @@ popmark = string "1" *> return POP_MARK
 -- Memo manipulation
 
 get', binget, long_binget, put', binput, long_binput :: Parser OpCode
-get' = string "g" *> (GET <$> decimalInt)
+get' = string "g" *> (GET <$> unsignedDecimalInt)
 binget = string "h" *> (BINGET . fromIntegral <$> anyWord8)
 long_binget = string "j" *> (LONG_BINGET . fromIntegral <$> uint4)
-put' = string "p" *> (PUT <$> decimalInt)
+put' = string "p" *> (PUT <$> unsignedDecimalInt)
 binput = string "q" *> (BINPUT . fromIntegral <$> anyWord8)
 long_binput = string "r" *> (LONG_BINPUT . fromIntegral <$> uint4)
 
@@ -181,7 +185,7 @@ ext4 = string "\132" *> (EXT4 . fromIntegral <$> uint4) -- same as \x84
 -- Various
 
 global, reduce, build, inst, obj, newobj :: Parser OpCode
-global = string "c" *> (GLOBAL <$> stringnl <*> stringnl)
+global = string "c" *> (GLOBAL <$> stringnl_noescape <*> stringnl_noescape)
 reduce = string "R" *> return REDUCE
 build = string "b" *> return BUILD
 inst = string "i" *> (INST <$> stringnl_noescape <*> stringnl_noescape)
@@ -205,9 +209,12 @@ binpersid = string "Q" *> return BINPERSID
 decimalInt :: Parser Int
 decimalInt = signed decimal <* string "\n"
 
+unsignedDecimalInt :: Parser Natural
+unsignedDecimalInt = decimal <* string "\n"
+
 -- TODO document the differences with Python's representation.
 doubleFloat :: Parser Double
-doubleFloat = double <* string "\n"
+doubleFloat = choice [double, string "inf" *> pure (1/0), string "-inf" *> pure (-1/0), string "nan" *> pure (0/0)] <* string "\n"
 
 decimalLong :: Parser Integer
 decimalLong = signed decimal <* string "L\n"
@@ -277,33 +284,31 @@ stringnl = do
                 'r'  -> "\r" <$ anyWord8
                 't'  -> "\t" <$ anyWord8
                 'v'  -> "\v" <$ anyWord8
-                'x'  -> SB.word8 <$> hexadecimalExact 2
+                'x'  -> anyWord8 *> (SB.word8 <$> hexadecimalExact 2)
                 x | isOctDigit_w8 (fromEnum x) -> SB.word8 <$> octalLim 3
                   | otherwise -> fail $ "Unsupported escape: \\" ++ show x
         quote = AC.satisfy $ \x -> x == '\'' || x == '"'
 unicodestringnl :: Parser Text
-unicodestringnl = do
-  open <- quote
-  TL.toStrict . TB.toLazyText . mconcat <$> manyTill (charOrEscape open) (AC.char open)  <* AC.char '\n'
+unicodestringnl = TL.toStrict . TB.toLazyText . mconcat <$> manyTill charOrEscape (AC.char '\n')
       where 
-        charOrEscape q = choice [unescapedChunk, escapeSeq]
+        charOrEscape = choice [unescapedChunk, escapeSeq]
           where
             unescapedChunk = do
-              chunk <- decodeUtf8' <$> AC.takeWhile1 (\c -> c /= '\\' && c /= q)
+              chunk <- decodeUtf8' <$> AC.takeWhile1 (\c -> c /= '\\' && c /= '\n')
               either (fail . show) (return . TB.fromText) chunk
             escapeSeq = do
               c <- AC.char '\\' *> AC.anyChar
               case c of
-                'u' -> TB.singleton . toEnum <$> hexadecimalExact 4
-                'U' -> TB.singleton . toEnum <$> hexadecimalExact 8
-                x -> return $ "\\" <> TB.singleton x
-        quote = AC.satisfy $ \x -> x == '\'' || x == '"'
+                'u' -> unquote $ hexadecimalExact 4
+                'U' -> unquote $ hexadecimalExact 8
+                x -> return ("\\" <> TB.singleton x)
+        unquote p = TB.singleton . toEnum <$> p
 octalLim :: (Bits a, Integral a) => Int -> Parser a
 octalLim maxcnt = fst . snd <$> A.runScanner (0,maxcnt) step
-  where step (total, cnt) w = if isOctDigit_w8 w && cnt >= 0 then Just ((total `shiftL` 3) .|. fromIntegral (w - 48), cnt - 1) else Nothing
+  where step (total, cnt) w = if isOctDigit_w8 w && cnt > 0 then Just ((total `shiftL` 3) .|. fromIntegral (w - 48), cnt - 1) else Nothing
 hexadecimalLim :: (Bits a, Integral a) => Int -> Parser a
 hexadecimalLim maxcnt = fst . snd <$> A.runScanner (0,maxcnt) step
-  where step (total, cnt) w = if isHexDigit w && cnt >= 0 then Just (step' total w, cnt - 1) else Nothing
+  where step (total, cnt) w = if isHexDigit w && cnt > 0 then Just (step' total w, cnt - 1) else Nothing
         isHexDigit w = (w >= 48 && w <= 57) ||
                       (w >= 97 && w <= 102) ||
                       (w >= 65 && w <= 70)
@@ -315,7 +320,7 @@ hexadecimalExact :: (Bits a, Integral a) => Int -> Parser a
 hexadecimalExact maxcnt = do 
   (res, finalCount) <- snd <$> A.runScanner (0,maxcnt) step
   if finalCount > 0 then fail "Malformed decimal" else return res
-  where step (total, cnt) w = if isHexDigit w && cnt >= 0 then Just (step' total w, cnt - 1) else Nothing
+  where step (total, cnt) w = if isHexDigit w && cnt > 0 then Just (step' total w, cnt - 1) else Nothing
         isHexDigit w = (w >= 48 && w <= 57) ||
                         (w >= 97 && w <= 102) ||
                         (w >= 65 && w <= 70)
@@ -327,7 +332,7 @@ isOctDigit_w8 :: (Ord a, Num a) => a -> Bool
 isOctDigit_w8 w = w - 48 <= 7
 
 stringnl_noescape :: Parser S.ByteString
-stringnl_noescape = takeTill (== toEnum 10)
+stringnl_noescape = takeTill (== toEnum 10) <* word8 10
 float8 :: Parser Double
 float8 = do
   w <- runGet getFloat64be <$> A.take 8
@@ -341,15 +346,8 @@ bytes4 :: Parser S.ByteString
 bytes4 = do
   w <- runGet getWord32le <$> A.take 4
   either fail (A.take . fromIntegral) w
-int4 :: Parser Int
-int4 = do
-  w <- runGet getWord32le <$> A.take 4
-  case w of
-    Left err -> fail err
-    Right x -> return . fromIntegral $ coerce x
-  where
-  coerce :: Word32 -> Int32
-  coerce = fromIntegral
+int4 :: Parser Int32
+int4 = fromIntegral <$> A.anyWord32le
 
 uint1 :: Parser Word8
 uint1 = anyWord8
@@ -360,85 +358,146 @@ uint2 = do
     Left err -> fail err
     Right x -> return $ fromIntegral x
 uint4 :: Parser Word32
-uint4 = runGet getWord32le <$> A.take 4 >>= either fail return
+uint4 = A.anyWord32le
 ----------------------------------------------------------------------
 -- Pickle opcodes serialization
 ----------------------------------------------------------------------
 
-serialize :: OpCode -> Put
+serialize :: OpCode -> SB.Builder
 serialize opcode = case opcode of
-  BINGET i -> putByteString "h" >> putWord8 (fromIntegral i)
-  BINPUT i -> putByteString "q" >> putWord8 (fromIntegral i)
-  BININT i -> putByteString "J" >> putWord32le (fromIntegral i)
-  BININT1 i -> putByteString "K" >> putWord8 (fromIntegral i)
-  BININT2 i -> putByteString "M" >> putUint2 i
-  NONE -> putByteString "N"
-  NEWTRUE -> putByteString "\136"
-  NEWFALSE -> putByteString "\137"
-  LONG1 0 -> putByteString "\138\NUL"
-  LONG1 i -> putByteString "\138" >> encodeLong1 i
-  BINFLOAT d -> putByteString "G" >> putFloat8 d
-  SHORT_BINSTRING s -> do
-    putByteString "U"
-    putWord8 . fromIntegral $ S.length s
-    putByteString s
-  BINSTRING s -> do
-    putByteString "T"
-    putWord32le . fromIntegral $ S.length s
-    putByteString s
-  BINUNICODE s -> do
-    putByteString "X"
-    let s' = encodeUtf8 s
-    putWord32le . fromIntegral $ S.length s'
-    putByteString s'
-  EMPTY_DICT -> putByteString "}"
-  EMPTY_LIST -> putByteString "]"
-  EMPTY_TUPLE -> putByteString ")"
-  LIST -> putByteString "l"
-  TUPLE -> putByteString "t"
-  TUPLE1 -> putByteString "\133"
-  TUPLE2 -> putByteString "\134"
-  TUPLE3 -> putByteString "\135"
-  MARK -> putByteString "("
-  SETITEM -> putByteString "s"
-  SETITEMS -> putByteString "u"
-  APPEND -> putByteString "a"
-  APPENDS -> putByteString "e"
+  PROTO i -> SB.word8 0x80 <> SB.word8 i
+  STOP -> "."
+  DUP -> "2"
+  POP -> "0"
+  POP_MARK -> "1"
+  GLOBAL mod attr -> "c" <> SB.byteString mod <> "\n" <> SB.byteString attr <> "\n"
+  BUILD -> "b"
+  INST mod attr -> "i" <> SB.byteString mod <> "\n" <> SB.byteString attr <> "\n"
+  OBJ -> "o"
+  REDUCE -> "R"
+  PERSID x -> "P" <> SB.byteString x <> "\n"
+  BINPERSID -> "Q"
+  NEWOBJ -> SB.word8 0x81
+  NEWTRUE -> SB.word8 0x88
+  NEWFALSE -> SB.word8 0x89
+  GET i -> "g" <> SB.integerDec (fromIntegral i) <> "\n"
+  BINGET i -> "h" <> SB.word8 (fromIntegral i)
+  LONG_BINGET i -> "j" <> SB.word32LE (fromIntegral i)
+  PUT i -> "p" <> SB.integerDec (fromIntegral i) <> "\n"
+  BINPUT i -> "q" <> SB.word8 i
+  LONG_BINPUT i -> "r" <> SB.word32LE i
+  BININT i -> "J" <> SB.int32LE (fromIntegral i)
+  BININT1 i -> "K" <> SB.word8 i
+  BININT2 i -> "M" <> SB.word16LE i
+  NONE -> "N"
+  INT i -> "I" <> SB.intDec i <> "\n"
+  FLOAT f -> "F" <> encodeFloatnl f
+  LONG i -> "L" <> SB.integerDec i <> "L\n"
+  LONG1 0 -> SB.word8 0x8a <> SB.word8 0x00
+  LONG1 i -> SB.word8 0x8a <> encodeLong1 i
+  LONG4 i -> SB.word8 0x8b <> encodeLong4 i
+  BINFLOAT d -> "G" <> SB.doubleBE d
+  STRING s -> "S'" <> encodeString s <> "'\n"
+  SHORT_BINSTRING s -> "U" <> encBSWithLen SB.word8 s
+  BINSTRING s -> "T" <> encBSWithLen SB.word32LE s
+  UNICODE s -> "V" <> encodeUnicode s <> "\n"
+  BINUNICODE s -> "X" <> encBSWithLen SB.word32LE (encodeUtf8 s)
+  SHORT_BINBYTES b -> "C" <> encBSWithLen SB.word8 b
+  BINBYTES b -> "B" <> encBSWithLen SB.word32LE b
+  EMPTY_DICT -> "}"
+  EMPTY_LIST -> "]"
+  EMPTY_TUPLE -> ")"
+  LIST -> "l"
+  TUPLE -> "t"
+  TUPLE1 -> SB.word8 0x85
+  TUPLE2 -> SB.word8 0x86
+  TUPLE3 -> SB.word8 0x87
+  MARK -> "("
+  DICT -> "d"
+  SETITEM -> "s"
+  SETITEMS -> "u"
+  APPEND -> "a"
+  APPENDS -> "e"
+  EXT1 x -> SB.word8 0x82 <> SB.word8 x
+  EXT2 x -> SB.word8 0x83 <> SB.word16LE x
+  EXT4 x -> SB.word8 0x84 <> SB.word32LE x
   x -> error $ "serialize: " ++ show x
 
-putFloat8 :: Double -> Put
-putFloat8 d = putFloat64be d
+encBSWithLen :: Integral a => (a -> SB.Builder) -> S.ByteString -> SB.Builder
+encBSWithLen encodeLen s = encodeLen (fromIntegral . S.length $ s) <> SB.byteString s
 
-putUint2 :: Int -> Put
-putUint2 d = putWord16le (fromIntegral d)
+encodeUnicode :: Text -> SB.Builder
+encodeUnicode = SBP.primUnfoldrBounded escape T.uncons
+  where
+    uEscape = SBP.condB (\c -> fromEnum c < fromIntegral (maxBound :: Word16)) (escapeWith 'u' SBP.int16HexFixed) (escapeWith 'U' SBP.int32HexFixed)
+    escapeWith c enc = SBP.liftFixedToBounded $ (\x -> ('\\', (c, fromIntegral $ fromEnum x))) SBP.>$< SBP.char7 SBP.>*< SBP.char7 SBP.>*< enc
+    escape = SBP.condB (\c -> fromEnum c > 127 || c == '\n' || c == '\\') uEscape (SBP.liftFixedToBounded SBP.char7) 
 
-encodeLong1 :: Integer -> Put
-encodeLong1 i = do
-  -- TODO is it possible to know xs length without really constructing xs?
-  let xs = f $ abs i
-      f j | j < 256 = [fromIntegral j]
-          | otherwise = let (n, r) = j `divMod` 256 in fromIntegral r : f n
-      e = 256 ^ length xs
-  if i < 0
-    then
-      if (abs i) > e `div` 2
-        then do
-          putWord8 (fromIntegral $ length xs + 1)
-          mapM_ putWord8 $ f (e + i)
-          putWord8 255
-        else do
-          putWord8 (fromIntegral $ length xs)
-          mapM_ putWord8 $ f (e + i)
-    else
-      if i > e `div` 2 - 1
-        then do
-          putWord8 (fromIntegral $ length xs + 1)
-          mapM_ putWord8 xs
-          putWord8 0
-        else do
-          putWord8 (fromIntegral $ length xs)
-          mapM_ putWord8 xs
+encodeString :: S.ByteString -> SB.Builder
+encodeString = SC.foldl escape mempty
+    where 
+      escape b c = b <> escape' c
+      escape' c = case c of
+        '\\' -> "\\\\"
+        '\'' -> "\\'"
+        '\a' -> "\\a"
+        '\b' -> "\\b"
+        '\f' -> "\\f"
+        '\n' -> "\\n"
+        '\r' -> "\\r"
+        '\t' -> "\\t"
+        '\v' -> "\\v"
+        x | C.ord x < 20 || C.ord x > 127 -> "\\x" <> SB.word8HexFixed (fromIntegral $ C.ord x)
+          | otherwise -> SB.char7 c
 
+encodeFloatnl :: Double -> SB.Builder
+encodeFloatnl d | isInfinite d && d > 0 = "inf\n"
+              | isInfinite d && d < 0 = "-inf\n"
+              | isNaN d = "nan\n"
+              | otherwise = SB.doubleDec d <> "\n"
+
+encodeLong1 :: Integer -> SB.Builder
+encodeLong1 = encBSWithLen SB.word8 . i2bs
+
+encodeLong4 :: Integer -> SB.Builder
+encodeLong4 = encBSWithLen SB.word32LE . i2bs
+bs2i :: S.ByteString -> Integer
+bs2i b
+   | sign = go b - 2 ^ (S.length b * 8)
+   | otherwise = go b
+   where
+      go = S.foldl' (\i b -> (i `shiftL` 8) + fromIntegral b) 0
+      sign = S.index b 0 > 127
+
+integerBytes :: Integer -> Int
+integerBytes x = (integerLogBase 2 (abs x) + 1) `quot` 8 + 1
+
+i2bs :: Integer -> S.ByteString
+i2bs x
+   | x == 0 = S.singleton 0
+   | x == (-1) = S.singleton 255
+   | x < 0 = i2bs' (2 ^ (8 * bytes) + x) <> if needFreshByte then "\xff" else mempty
+   | otherwise = i2bs' x <> if needFreshByte then "\0" else mempty
+   where
+      needFreshByte = topBit `mod` 8 == 0
+      topBit = integerLogBase 2 (if x < 0 then abs x - 1 else x)  + 1
+      i2bs' = S.unfoldr go
+      bytes = integerBytes x
+      go 0 = Nothing
+      go 255 = Nothing
+      go i = Just (fromIntegral i, i `shiftR` 8)
+
+integerLogBase :: Integer -> Integer -> Int
+integerLogBase b i =
+     if i < b then
+        0
+     else
+        -- Try squaring the base first to cut down the number of divisions.
+        let l = 2 * integerLogBase (b*b) i
+            doDiv :: Integer -> Int -> Int
+            doDiv i l = if i < b then l else doDiv (i `div` b) (l+1)
+        in  doDiv (i `div` (b^l)) l
+        
 ----------------------------------------------------------------------
 -- Pickle opcodes
 ----------------------------------------------------------------------
@@ -446,9 +505,9 @@ encodeLong1 i = do
 data OpCode =
   -- Integers
     INT Int
-  | BININT Int
-  | BININT1 Int
-  | BININT2 Int
+  | BININT Int32
+  | BININT1 Word8
+  | BININT2 Word16
   | LONG Integer
   | LONG1 Integer
   | LONG4 Integer
@@ -501,17 +560,17 @@ data OpCode =
   | POP_MARK
 
   -- Memo manipulation
-  | GET Int
-  | BINGET Int
-  | LONG_BINGET Int
-  | PUT Int
-  | BINPUT Int
-  | LONG_BINPUT Int
+  | GET Natural
+  | BINGET Word8
+  | LONG_BINGET Word32
+  | PUT Natural
+  | BINPUT Word8
+  | LONG_BINPUT Word32
 
   -- Extension registry (predefined objects)
-  | EXT1 Int
-  | EXT2 Int
-  | EXT4 Int
+  | EXT1 Word8
+  | EXT2 Word16
+  | EXT4 Word32
 
   -- Various
   | GLOBAL S.ByteString S.ByteString
@@ -522,13 +581,13 @@ data OpCode =
   | NEWOBJ
 
   -- Pickle machine control
-  | PROTO Int -- in [2..255]
+  | PROTO Word8 -- in [2..255]
   | STOP
 
   -- Persistent IDs
   | PERSID S.ByteString
   | BINPERSID
-  deriving Show
+  deriving (Show, Generic, Eq)
 
 {-
 protocol0 = [INT, LONG, STRING, NONE, UNICODE, FLOAT, APPEND, LIST, TUPLE,
@@ -616,8 +675,9 @@ popN n = do
 pushMark :: Unpickler ()
 pushMark = modify $ \s -> s{usStack = []:usStack s}
 
-remember :: Int -> Value -> Unpickler ()
-remember i v = modify $ \s -> s{usMemo = IM.insert i v $ usMemo s}
+remember :: Integral a => a -> Value -> Unpickler ()
+remember i v = modify $ \s -> s{usMemo = IM.insert (fromIntegral i) v $ usMemo s}
+
 toPairs :: Monad m => [a] -> m [(a, a)]
 toPairs (a:b:xs) = ((a,b):) <$> toPairs xs
 toPairs [_] = fail "toPairs: Can't pair up odd list"
@@ -656,9 +716,9 @@ executeOne NONE = pushS None
 executeOne NEWTRUE = pushS (Bool True)
 executeOne NEWFALSE = pushS (Bool False)
 executeOne (INT i) = pushS (BinInt i)
-executeOne (BININT i) = pushS (BinInt i)
-executeOne (BININT1 i) = pushS (BinInt i)
-executeOne (BININT2 i) = pushS (BinInt i)
+executeOne (BININT i) = pushS (BinInt $ fromIntegral i)
+executeOne (BININT1 i) = pushS (BinInt $ fromIntegral i)
+executeOne (BININT2 i) = pushS (BinInt $ fromIntegral i)
 executeOne (LONG i) = pushS (BinLong i)
 executeOne (LONG1 i) = pushS (BinLong i)
 executeOne (FLOAT d) = pushS (BinFloat d)
@@ -684,10 +744,10 @@ executeOne (PROTO _) = return ()
 executeOne STOP = return ()
 executeOne op = fail $ "Can't execute opcode " ++ show op ++ "."
 
-executeLookup :: Int -> Unpickler ()
+executeLookup :: Integral a => a -> Unpickler ()
 executeLookup k = do 
   memo <- gets usMemo
-  case IM.lookup k memo of
+  case IM.lookup (fromIntegral k) memo of
     Nothing -> fail "Unknown memo key"
     Just s -> pushS s
 
@@ -767,7 +827,7 @@ pickle' :: Value -> Pickler ()
 pickle' value = do
   m <- gets memoMap
   case M.lookup value m of
-    Just k -> tell [BINGET k]
+    Just k -> tell [BINGET (fromIntegral k)]
     Nothing -> case value of
       Dict d -> pickleDict d
       Memorable v  -> modify (\s -> s{memoizeNext = True}) >> pickle' v
@@ -776,21 +836,23 @@ pickle' value = do
       None -> tell [NONE]
       Bool True -> tell [NEWTRUE]
       Bool False -> tell [NEWFALSE]
-      BinInt i -> pickleBinInt i
+      BinInt i -> pickleBinInt (fromIntegral i)
       BinLong i -> pickleBinLong i
       BinFloat d -> pickleBinFloat d
       BinString s -> pickleBinString s
       BinUnicode s -> pickleBinUnicode s
       x            -> error $ "TODO: pickle " ++ show x
 
--- TODO actually lookup values in the map, reusing their key.
 binput' :: Value -> Pickler ()
 binput' value = do
   shouldStore <- gets memoizeNext
   when shouldStore $ do
     i <- gets $ M.size . memoMap
     modify $ \s -> s{memoMap = M.insert value i (memoMap s), memoizeNext = memoizeAll s}
-    tell [BINPUT i]
+    case i of
+      x | x < fromIntegral (maxBound :: Word8) -> tell [BINPUT (fromIntegral x)]
+        | x < fromIntegral (maxBound :: Word32) -> tell [LONG_BINPUT (fromIntegral x)]
+        | otherwise -> tell [PUT (fromIntegral x)]
 
 pickleDict :: Map Value Value -> Pickler ()
 pickleDict d = do
@@ -850,9 +912,9 @@ pickleTuple xs = do
   tell [TUPLE]
   binput' (Tuple xs)
 
-pickleBinInt :: Int -> Pickler ()
-pickleBinInt i | i >= 0 && i < 256 = tell [BININT1 i]
-               | i >= 256 && i < 65536 = tell [BININT2 i]
+pickleBinInt :: Int32 -> Pickler ()
+pickleBinInt i | i >= 0 && i < 256 = tell [BININT1 (fromIntegral i)]
+               | i >= 256 && i < 65536 = tell [BININT2 (fromIntegral i)]
                | otherwise = tell [BININT i]
 
 pickleBinLong :: Integer -> Pickler ()

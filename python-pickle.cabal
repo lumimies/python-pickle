@@ -19,6 +19,7 @@ source-repository head
 library
   build-depends:       attoparsec == 0.13.*,
                        base == 4.*,
+                       attoparsec-binary == 0.2.*,
                        bytestring == 0.10.*,
                        text >= 1.2,
                        cereal == 0.5.*,
@@ -50,6 +51,11 @@ test-suite pickled-values
     python-pickle,
     process == 1.4.*,
     test-framework == 0.8.*,
-    test-framework-hunit == 0.3.*
+    test-framework-hunit == 0.3.*,
+    test-framework-quickcheck2 == 0.3.*,
+    QuickCheck >= 2.8 && < 3,
+    cereal == 0.5.*,
+    testing-feat == 0.4.*,
+    text >= 1.2
 
   ghc-options: -Wall

@@ -1,5 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TemplateHaskell #-}
 -- | This test suite for the `python-pickle` package uses Python to dump
 -- various pickled objects to a temporary file, and for each dump checks
 -- that `Language.Python.Pickle` can unpickle the object, and repickle it
@@ -9,7 +10,10 @@ module Main (main) where
 import Control.Arrow ((&&&))
 import Control.Monad (when)
 import qualified Data.ByteString as S
+import Data.ByteString.Builder (toLazyByteString)
+import Data.ByteString.Lazy (toStrict)
 import qualified Data.ByteString.Char8 as C
+import qualified Data.Text as T
 import Data.String (IsString)
 import qualified Data.Map as M
 import System.Directory (removeFile)
@@ -17,11 +21,33 @@ import System.Process (rawSystem)
 import Test.HUnit (assertEqual, assertFailure)
 import Test.Framework (defaultMain, testGroup, Test)
 import Test.Framework.Providers.HUnit (testCase)
+import Test.Framework.Providers.QuickCheck2
+import Test.QuickCheck
+import Test.Feat
+import Test.Feat.Modifiers (nat, Infinite)
+import Numeric.Natural
 import Language.Python.Pickle
 
+deriveEnumerable ''OpCode
+instance Enumerable S.ByteString where
+  enumerate = S.pack <$> enumerate
+instance Enumerable T.Text where
+  enumerate = T.pack <$> enumerate
+instance Infinite Natural where
+instance Enumerable Natural where
+  enumerate = nat <$> enumerate
+instance Arbitrary OpCode where
+  arbitrary = sized uniform `suchThat` noFunnyBusiness
+    where
+      noFunnyBusiness (GLOBAL s1 s2) = C.notElem '\n' s1 && C.notElem '\n' s2
+      noFunnyBusiness (INST s1 s2) = C.notElem '\n' s1 && C.notElem '\n' s2
+      noFunnyBusiness (PERSID s) = C.notElem '\n' s
+      noFunnyBusiness _ = True
 main :: IO ()
 
 main = defaultMain tests
+
+prop_OpsRoundtrip (NonEmpty x) = parse (toStrict . toLazyByteString . mconcat $ map serialize x) == Right x
 
 tests :: [Test]
 tests =
@@ -31,6 +57,7 @@ tests =
       map (\(a, b) -> testCase a $ testAgainstPython 1 b a) expressions
   , testGroup "PickledValues protocol 2" $
       map (\(a, b) -> testCase a $ testAgainstPython 2 b a) expressions
+  , testGroup "Roundtrip ops" [testProperty "Ops roundtrip"  prop_OpsRoundtrip]
   ]
 
 -- The round-tripping (unpickling/pickling and comparing the original
