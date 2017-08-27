@@ -85,46 +85,46 @@ testAgainstPython protocol expected s = do
 
 expressions :: [(String, Value)]
 expressions =
-  [ ("{}", Dict M.empty)
+  [ ("{}", PyDict M.empty)
   , ("{'type': 'cache-query'}",
-      Dict $ M.fromList [(BinString "type", BinString "cache-query")])
+      PyDict $ M.fromList [(PyString "type", PyString "cache-query")])
   , ("{'type': 'cache-query', 'metric': 'some.metric.name'}",
-      Dict $ M.fromList [(BinString "type", BinString "cache-query"),
-        (BinString "metric", BinString "some.metric.name")])
+      PyDict $ M.fromList [(PyString "type", PyString "cache-query"),
+        (PyString "metric", PyString "some.metric.name")])
 
   , ("[]", List [])
-  , ("[1]", List [BinInt 1])
-  , ("[1, 2]", List [BinInt 1, BinInt 2])
-  , ("[True, 0, 1, False]", List [Bool True, BinInt 0, BinInt 1, Bool False])
+  , ("[1]", List [PyInt 1])
+  , ("[1, 2]", List [PyInt 1, PyInt 2])
+  , ("[True, 0, 1, False]", List [PyBool True, PyInt 0, PyInt 1, PyBool False])
   , ("()", Tuple [])
-  , ("(1,)", Tuple [BinInt 1])
-  , ("(1, 2)", Tuple [BinInt 1, BinInt 2])
-  , ("(1, 2, 3)", Tuple [BinInt 1, BinInt 2, BinInt 3])
-  , ("(1, 2, 3, 4)", Tuple [BinInt 1, BinInt 2, BinInt 3, BinInt 4])
+  , ("(1,)", Tuple [PyInt 1])
+  , ("(1, 2)", Tuple [PyInt 1, PyInt 2])
+  , ("(1, 2, 3)", Tuple [PyInt 1, PyInt 2, PyInt 3])
+  , ("(1, 2, 3, 4)", Tuple [PyInt 1, PyInt 2, PyInt 3, PyInt 4])
   , ("((), [], [3, 4], {})",
-    Tuple [Tuple [], List [], List [BinInt 3, BinInt 4], Dict M.empty])
+    Tuple [Tuple [], List [], List [PyInt 3, PyInt 4], PyDict M.empty])
 
   , ("None", None)
-  , ("True", Bool True)
-  , ("False", Bool False)
+  , ("True", PyBool True)
+  , ("False", PyBool False)
 
   , ("{'datapoints': [(1, 2)]}",
-      Dict $ M.fromList [(BinString "datapoints",
-        List [Tuple [BinInt 1, BinInt 2]])])
+      PyDict $ M.fromList [(PyString "datapoints",
+        List [Tuple [PyInt 1, PyInt 2]])])
   , ("{'datapoints': [(1, 2)], (2,): 'foo'}",
-        Dict $ M.fromList
-          [ ( BinString "datapoints"
-            , List [Tuple [BinInt 1, BinInt 2]])
-          , ( Tuple [BinInt 2]
-            , BinString "foo")
+        PyDict $ M.fromList
+          [ ( PyString "datapoints"
+            , List [Tuple [PyInt 1, PyInt 2]])
+          , ( Tuple [PyInt 2]
+            , PyString "foo")
           ])
-  , ("[(1, 2)]", List [Tuple [BinInt 1, BinInt 2]])
-  , ("('twice', 'twice')", Tuple [BinString "twice", BinString "twice"])
+  , ("[(1, 2)]", List [Tuple [PyInt 1, PyInt 2]])
+  , ("('twice', 'twice')", Tuple [PyString "twice", PyString "twice"])
   ]
-  ++ map (show &&& BinInt) ints
-  ++ map (show &&& BinFloat) doubles
-  ++ map (quote . C.unpack &&& BinString) strings
-  ++ map ((++ "L") . show &&& BinLong . toInteger) ints
+  ++ map (show &&& PyInt) ints
+  ++ map (show &&& PyFloat) doubles
+  ++ map (quote . C.unpack &&& PyString) strings
+  ++ map ((++ "L") . show &&& PyLong . toInteger) ints
 
 ints :: [Int]
 ints =
