@@ -38,7 +38,7 @@ import Data.Text.Encoding
 import Data.Word (Word32, Word16, Word8)
 import GHC.Generics
 
-
+{-# ANN module ("HLint: ignore Use camelCase"::String) #-}
 
 -- | Parse a pickled object to a list of opcodes.
 parse :: S.ByteString -> Either String [OpCode]
@@ -545,7 +545,7 @@ integerLogBase b i = if i < b
    -- Try squaring the base first to cut down the number of divisions.
     let l = 2 * integerLogBase (b * b) i
         doDiv :: Integer -> Int -> Int
-        doDiv i l = if i < b then l else doDiv (i `div` b) (l + 1)
+        doDiv i' l' = if i' < b then l' else doDiv (i' `div` b) (l' + 1)
     in  doDiv (i `div` (b ^ l)) l
 
 ----------------------------------------------------------------------
@@ -904,7 +904,7 @@ pickle' value = do
       PyFloat   d     -> pickleBinFloat d
       PyString  s     -> pickleBinString s
       PyUnicode s     -> pickleBinUnicode s
-      x               -> error $ "TODO: pickle " ++ show x
+      PyBytes   s     -> pickleBinBytes s
 
 binput' :: Value -> Pickler ()
 binput' value = do
@@ -993,6 +993,11 @@ pickleBinFloat d = tell [BINFLOAT d]
 pickleBinString :: S.ByteString -> Pickler ()
 pickleBinString s = do
   tell $ if S.length s < 256 then [SHORT_BINSTRING s] else [BINSTRING s]
+  binput' (PyBytes s)
+
+pickleBinBytes :: S.ByteString -> Pickler ()
+pickleBinBytes s = do
+  tell $ if S.length s < 256 then [SHORT_BINBYTES s] else [BINBYTES s]
   binput' (PyString s)
 
 pickleBinUnicode :: Text -> Pickler ()
