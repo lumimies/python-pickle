@@ -92,34 +92,34 @@ expressions =
       PyDict $ M.fromList [(PyString "type", PyString "cache-query"),
         (PyString "metric", PyString "some.metric.name")])
 
-  , ("[]", List [])
-  , ("[1]", List [PyInt 1])
-  , ("[1, 2]", List [PyInt 1, PyInt 2])
-  , ("[True, 0, 1, False]", List [PyBool True, PyInt 0, PyInt 1, PyBool False])
-  , ("()", Tuple [])
-  , ("(1,)", Tuple [PyInt 1])
-  , ("(1, 2)", Tuple [PyInt 1, PyInt 2])
-  , ("(1, 2, 3)", Tuple [PyInt 1, PyInt 2, PyInt 3])
-  , ("(1, 2, 3, 4)", Tuple [PyInt 1, PyInt 2, PyInt 3, PyInt 4])
+  , ("[]", PyList [])
+  , ("[1]", PyList [PyInt 1])
+  , ("[1, 2]", PyList [PyInt 1, PyInt 2])
+  , ("[True, 0, 1, False]", PyList [PyBool True, PyInt 0, PyInt 1, PyBool False])
+  , ("()", PyTuple [])
+  , ("(1,)", PyTuple [PyInt 1])
+  , ("(1, 2)", PyTuple [PyInt 1, PyInt 2])
+  , ("(1, 2, 3)", PyTuple [PyInt 1, PyInt 2, PyInt 3])
+  , ("(1, 2, 3, 4)", PyTuple [PyInt 1, PyInt 2, PyInt 3, PyInt 4])
   , ("((), [], [3, 4], {})",
-    Tuple [Tuple [], List [], List [PyInt 3, PyInt 4], PyDict M.empty])
+    PyTuple [PyTuple [], PyList [], PyList [PyInt 3, PyInt 4], PyDict M.empty])
 
-  , ("None", None)
+  , ("None", PyNone)
   , ("True", PyBool True)
   , ("False", PyBool False)
 
   , ("{'datapoints': [(1, 2)]}",
       PyDict $ M.fromList [(PyString "datapoints",
-        List [Tuple [PyInt 1, PyInt 2]])])
+        PyList [PyTuple [PyInt 1, PyInt 2]])])
   , ("{'datapoints': [(1, 2)], (2,): 'foo'}",
         PyDict $ M.fromList
           [ ( PyString "datapoints"
-            , List [Tuple [PyInt 1, PyInt 2]])
-          , ( Tuple [PyInt 2]
+            , PyList [PyTuple [PyInt 1, PyInt 2]])
+          , ( PyTuple [PyInt 2]
             , PyString "foo")
           ])
-  , ("[(1, 2)]", List [Tuple [PyInt 1, PyInt 2]])
-  , ("('twice', 'twice')", Tuple [PyString "twice", PyString "twice"])
+  , ("[(1, 2)]", PyList [PyTuple [PyInt 1, PyInt 2]])
+  , ("('twice', 'twice')", PyTuple [PyString "twice", PyString "twice"])
   ]
   ++ map (show &&& PyInt) ints
   ++ map (show &&& PyFloat) doubles
